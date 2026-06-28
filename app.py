@@ -5,23 +5,9 @@ from flask import Flask, render_template, jsonify, request
 
 app = Flask(__name__)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH  = os.path.join(BASE_DIR, "midnapore_flood.db")
-
-
-def find_excel_file(keywords):
-    for root, _, files in os.walk(BASE_DIR):
-        for name in files:
-            if not name.lower().endswith(".xlsx"):
-                continue
-            lower_name = name.lower()
-            if all(keyword.lower() in lower_name for keyword in keywords):
-                return os.path.join(root, name)
-    return None
-
-
-FILE1 = find_excel_file(["river", "gauge", "rain", "fall", "reservior"]) or find_excel_file(["river", "gauge", "rain", "fall", "reservoir"])
-FILE2 = find_excel_file(["impact", "report", "rfcr"]) or find_excel_file(["impact", "report"])
+DB_PATH   = "midnapore_flood.db"
+FILE1     = "24_06_2026__River_Gauge___Rain_Fall__Reservior-RFCR__Midnapore.xlsx"
+FILE2     = "24_06_2026_Impact_Report_RFCR_Midnapore.xlsx"
 
 
 # ─── DB HELPERS ────────────────────────────────────────────────────
@@ -151,7 +137,6 @@ def load_rainfall(conn):
                 div = candidates[1] if len(candidates) > 1 else None
         if not station and rain24 is None and cum is None:
             continue
-        # Clean up station name (remove block info in brackets/newlines)
         if station:
             station = station.split('(')[0].split('\n')[0].strip()
         conn.execute("""
@@ -204,28 +189,41 @@ def load_rivers(conn):
 
 
 def load_reservoir(conn):
+    # Excel has merged cells so real data columns are at positions:
+    # 0=sl, 1=basin, 2=name, 4=conservation_ft, 6=max_flood_ft,
+    # 8=present_ft, 10=inflow, 12=outflow, 14=obs_time, 15=division
     df = pd.read_excel(FILE1, sheet_name='Resevior', header=None)
     rows_inserted = 0
     for i, row in df.iterrows():
         if i < 3:
             continue
-        vals = [clean(v) for v in row]
-        if all(v is None for v in vals):
+        # Only process rows that start with a number (actual data rows)
+        sl_raw = row.iloc[0]
+        try:
+            sl = int(float(str(sl_raw)))
+        except (ValueError, TypeError):
             continue
-        col = [vals[j] if j < len(vals) else None for j in range(10)]
-        if not (col[0] and col[0].isdigit()):
-            continue
-        if col[2] is None:
+        name = clean(row.iloc[2])
+        if not name:
             continue
         conn.execute("""
             INSERT INTO reservoir
-            (sl_no,basin,name,conservation_level_ft,max_flood_level_ft,
-             present_level_ft,inflow_acft,outflow_acft,observation_time,division)
+            (sl_no, basin, name,
+             conservation_level_ft, max_flood_level_ft, present_level_ft,
+             inflow_acft, outflow_acft, observation_time, division)
             VALUES (?,?,?,?,?,?,?,?,?,?)
-        """, (col[0], col[1], col[2],
-              safe_float(col[3]), safe_float(col[4]),
-              safe_float(col[5]), safe_float(col[6]),
-              safe_float(col[7]), col[8], col[9]))
+        """, (
+            str(sl),
+            clean(row.iloc[1]),           # basin
+            name,                          # reservoir name
+            safe_float(row.iloc[4]),       # conservation level ft
+            safe_float(row.iloc[6]),       # max flood level ft
+            safe_float(row.iloc[8]),       # present level ft
+            safe_float(row.iloc[10]),      # inflow ac-ft
+            safe_float(row.iloc[12]),      # outflow ac-ft
+            str(row.iloc[14]).strip() if row.iloc[14] is not None else None,  # obs time
+            clean(row.iloc[15]),           # division
+        ))
         rows_inserted += 1
     conn.commit()
     return rows_inserted
@@ -374,123 +372,124 @@ def api_reservoir():
 
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
-    q = request.json.get("question", "").lower().strip()
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        q = data.get("question", data.get("message", "")).lower().strip()
+        if not q:
+            return jsonify({"type":"text","content":"Please type a question."})
 
-    if any(w in q for w in ["hello","hi","help","what can"]):
-        return jsonify({"type":"text","content":"Hello! I can answer questions about rainfall, river levels, embankment damage, forecasts, and reservoir status for 24 June 2026. Try asking: <b>highest rainfall</b>, <b>rising rivers</b>, <b>embankment damage</b>, or type a district name like <b>Purulia</b>."})
+        if any(w in q for w in ["hello","hi","help","what can"]):
+            return jsonify({"type":"text","content":"Hello! I can answer questions about rainfall, river levels, embankment damage, forecasts, and reservoir status for 24 June 2026. Try asking: <b>highest rainfall</b>, <b>rising rivers</b>, <b>embankment damage</b>, or a district name like <b>Purulia</b>."})
 
-    if any(w in q for w in ["summary","overview","total","all info"]):
-        data = api_summary().get_json()
-        top = data.get("top_station")
-        res = data.get("reservoir")
-        html = f"""
-        <div class='sum-grid'>
-          <div class='sum-card'><span class='sum-num'>{data['total_stations']}</span><span class='sum-label'>Rain Stations</span></div>
-          <div class='sum-card rain'><span class='sum-num'>{data['active_stations']}</span><span class='sum-label'>With Rain</span></div>
-          <div class='sum-card warn'><span class='sum-num'>{data['rising_rivers']}</span><span class='sum-label'>Rivers Rising</span></div>
-          <div class='sum-card safe'><span class='sum-num'>{data['damage_incidents']}</span><span class='sum-label'>Damage Incidents</span></div>
-        </div>
-        """
-        if top:
-            html += f"<p class='mt'>🏆 Highest 24hr rain: <b>{top['station']}</b> ({top['district']}) — <b>{top['rainfall_24hr_mm']} mm</b></p>"
-        if res and res.get('present_level_ft'):
-            html += f"<p>💧 Mukutmanipur reservoir: <b>{res['present_level_ft']} ft</b> (safe, below {res['conservation_level_ft']} ft conservation level)</p>"
-        html += "<p>⚠️ Heavy rain warnings: <b class='safe-tag'>NIL</b> &nbsp;|&nbsp; Rivers above DL: <b class='safe-tag'>NONE</b></p>"
-        return jsonify({"type":"html","content":html})
-
-    if any(w in q for w in ["highest","most rain","top rain","maximum rain","which station"]):
-        rows = query("SELECT station, district, basin, rainfall_24hr_mm FROM rainfall_stations WHERE rainfall_24hr_mm IS NOT NULL AND rainfall_24hr_mm > 0 ORDER BY rainfall_24hr_mm DESC LIMIT 8")
-        return jsonify({"type":"table","title":"Top stations — last 24 hrs rainfall","cols":["station","district","basin","rainfall_24hr_mm"],"rows":rows})
-
-    if any(w in q for w in ["cumulative","since jan","total since"]):
-        rows = query("SELECT station, district, cumulative_mm FROM rainfall_stations WHERE cumulative_mm IS NOT NULL ORDER BY cumulative_mm DESC LIMIT 10")
-        return jsonify({"type":"table","title":"Top stations — cumulative rainfall (since 1 Jan 2026)","cols":["station","district","cumulative_mm"],"rows":rows})
-
-    if any(w in q for w in ["zero","no rain","dry","0 mm"]):
-        rows = query("SELECT station, district, rainfall_24hr_mm FROM rainfall_stations WHERE rainfall_24hr_mm = 0 ORDER BY district")
-        return jsonify({"type":"table","title":f"Stations with zero rainfall ({len(rows)} stations)","cols":["station","district","rainfall_24hr_mm"],"rows":rows})
-
-    if any(w in q for w in ["all station","list station","every station","all rain"]):
-        rows = query("SELECT station, district, basin, rainfall_24hr_mm, cumulative_mm FROM rainfall_stations ORDER BY district, rainfall_24hr_mm DESC NULLS LAST")
-        return jsonify({"type":"table","title":f"All {len(rows)} rainfall stations","cols":["station","district","basin","rainfall_24hr_mm","cumulative_mm"],"rows":rows})
-
-    for dist_kw, dist_val in [("purulia","PURULIA"),("bankura","BANKURA"),("jhargram","JHARGRAM"),("purba","PURBA MEDINIPUR"),("paschim","PASCHIM MEDINIPUR"),("west medinipur","PASCHIM MEDINIPUR"),("east medinipur","PURBA MEDINIPUR")]:
-        if dist_kw in q:
-            rows = query("SELECT station, basin, rainfall_24hr_mm, cumulative_mm FROM rainfall_stations WHERE UPPER(district) LIKE ? ORDER BY rainfall_24hr_mm DESC NULLS LAST", (f"%{dist_val}%",))
-            return jsonify({"type":"table","title":f"Rainfall — {dist_val.title()}","cols":["station","basin","rainfall_24hr_mm","cumulative_mm"],"rows":rows})
-
-    if any(w in q for w in ["rising river","rivers rising","river rise","which river"]):
-        rows = query("SELECT river, station, district, gauge_level, trend, danger_level_mGTS FROM river_gauges WHERE trend='Rising'")
-        extra = "<p class='mt safe-msg'>✅ None have crossed Danger Level (DL). All rivers are safe.</p>"
-        return jsonify({"type":"table","title":f"Rising rivers ({len(rows)})","cols":["river","station","gauge_level","trend","danger_level_mGTS"],"rows":rows,"extra":extra})
-
-    if any(w in q for w in ["danger level","above danger","crossed danger","above dl","flood level"]):
-        rows = query("""
-            SELECT river, station, gauge_level, trend, danger_level_mGTS
-            FROM river_gauges
-            WHERE gauge_level NOT IN ('BG') AND trend NOT IN ('--')
-            AND danger_level_mGTS IS NOT NULL
-            AND CAST(gauge_level AS REAL) >= danger_level_mGTS
-        """)
-        if rows:
-            return jsonify({"type":"table","title":"Rivers above Danger Level","cols":["river","station","gauge_level","trend","danger_level_mGTS"],"rows":rows})
-        return jsonify({"type":"text","content":"✅ <b>No river has crossed the Danger Level (DL).</b><br>All gauge stations are currently Below Gauge (BG) or well under their danger level threshold."})
-
-    if any(w in q for w in ["all river","river gauge","every river","river status","river level","show river"]):
-        rows = query("SELECT river, station, district, gauge_level, trend, danger_level_mGTS FROM river_gauges ORDER BY trend DESC, river")
-        return jsonify({"type":"table","title":f"All {len(rows)} river gauge stations","cols":["river","station","gauge_level","trend","danger_level_mGTS"],"rows":rows})
-
-    if any(w in q for w in ["embankment","damage","erosion","polaspai","daspur","slip","subsidence"]):
-        rows = query("SELECT district, block, description FROM embankment_damage")
-        return jsonify({"type":"damage","rows":rows})
-
-    if any(w in q for w in ["forecast","next 24","tomorrow","imd","warning","prediction"]):
-        rows = query("SELECT district, rainfall_status, river_status, forecast FROM district_status ds LEFT JOIN district_forecast df ON ds.district=df.district ORDER BY ds.district")
-        return jsonify({"type":"table","title":"District-wise forecast (IMD Kolkata) — next 24 hrs","cols":["district","rainfall_status","river_status","forecast"],"rows":rows})
-
-    if any(w in q for w in ["district status","current status","status of all","all district"]):
-        rows = query("SELECT district, rainfall_status, river_status FROM district_status ORDER BY district")
-        return jsonify({"type":"table","title":"Current district status","cols":["district","rainfall_status","river_status"],"rows":rows})
-
-    if any(w in q for w in ["reservoir","mukutmanipur","dam","conservation"]):
-        rows = query("SELECT * FROM reservoir WHERE name IS NOT NULL LIMIT 1")
-        if rows:
-            r = rows[0]
-            diff = (r.get("conservation_level_ft") or 0) - (r.get("present_level_ft") or 0)
-            html = f"""
-            <div class='res-grid'>
-              <div class='res-item'><span class='rl'>Conservation Level</span><span class='rv'>{r.get('conservation_level_ft')} ft</span></div>
-              <div class='res-item'><span class='rl'>Max Flood Level</span><span class='rv'>{r.get('max_flood_level_ft')} ft</span></div>
-              <div class='res-item'><span class='rl'>Present Level</span><span class='rv safe-tag'>{r.get('present_level_ft')} ft</span></div>
-              <div class='res-item'><span class='rl'>Inflow (24hrs)</span><span class='rv'>{r.get('inflow_acft')} ac-ft</span></div>
-              <div class='res-item'><span class='rl'>Outflow (24hrs)</span><span class='rv'>{r.get('outflow_acft')} ac-ft</span></div>
-              <div class='res-item'><span class='rl'>Observation Time</span><span class='rv'>{r.get('observation_time')}</span></div>
-            </div>
-            <p class='mt'>✅ Level is <b>{diff:.1f} ft</b> below conservation level — no concern.</p>
-            """
+        if any(w in q for w in ["summary","overview","total","all info"]):
+            d = api_summary().get_json()
+            top = d.get("top_station")
+            res = d.get("reservoir")
+            html = f"""<div class='sum-grid'>
+              <div class='sum-card'><span class='sum-num'>{d['total_stations']}</span><span class='sum-label'>Rain Stations</span></div>
+              <div class='sum-card rain'><span class='sum-num'>{d['active_stations']}</span><span class='sum-label'>With Rain</span></div>
+              <div class='sum-card warn'><span class='sum-num'>{d['rising_rivers']}</span><span class='sum-label'>Rivers Rising</span></div>
+              <div class='sum-card safe'><span class='sum-num'>{d['damage_incidents']}</span><span class='sum-label'>Damage Incidents</span></div>
+            </div>"""
+            if top:
+                html += f"<p class='mt'>🏆 Highest 24hr rain: <b>{top['station']}</b> ({top['district']}) — <b>{top['rainfall_24hr_mm']} mm</b></p>"
+            if res and res.get('present_level_ft'):
+                html += f"<p>💧 Mukutmanipur reservoir: <b>{res['present_level_ft']} ft</b> (safe, below {res['conservation_level_ft']} ft)</p>"
+            html += "<p>⚠️ Heavy rain warnings: <b class='safe-tag'>NIL</b> &nbsp;|&nbsp; Rivers above DL: <b class='safe-tag'>NONE</b></p>"
             return jsonify({"type":"html","content":html})
 
-    if any(w in q for w in ["inundation","flood area","waterlog","submerged"]):
-        return jsonify({"type":"text","content":"✅ <b>No inundation reported</b> in any district as of 24 June 2026.<br>All 5 districts show NIL under inundation assessment."})
+        if any(w in q for w in ["highest","most rain","top rain","maximum rain","which station"]):
+            rows = query("SELECT station, district, basin, rainfall_24hr_mm FROM rainfall_stations WHERE rainfall_24hr_mm IS NOT NULL AND rainfall_24hr_mm > 0 ORDER BY rainfall_24hr_mm DESC LIMIT 8")
+            return jsonify({"type":"table","title":"Top stations — last 24 hrs rainfall","cols":["station","district","basin","rainfall_24hr_mm"],"rows":rows})
 
-    if any(w in q for w in ["how many","count station","number of station","total station"]):
-        rows = query("SELECT district, COUNT(*) AS count FROM rainfall_stations GROUP BY district ORDER BY district")
-        total = query("SELECT COUNT(*) AS c FROM rainfall_stations")[0]["c"]
-        return jsonify({"type":"table","title":f"Total rainfall stations: {total}","cols":["district","count"],"rows":rows})
+        if any(w in q for w in ["cumulative","since jan","total since"]):
+            rows = query("SELECT station, district, cumulative_mm FROM rainfall_stations WHERE cumulative_mm IS NOT NULL ORDER BY cumulative_mm DESC LIMIT 10")
+            return jsonify({"type":"table","title":"Top stations — cumulative rainfall (since 1 Jan 2026)","cols":["station","district","cumulative_mm"],"rows":rows})
 
-    return jsonify({"type":"text","content":"I didn't understand that question. Try: <b>highest rainfall</b>, <b>rising rivers</b>, <b>embankment damage</b>, <b>reservoir</b>, <b>forecast</b>, or a district name like <b>Purulia</b> or <b>Bankura</b>."})
+        if any(w in q for w in ["zero","no rain","dry","0 mm"]):
+            rows = query("SELECT station, district, rainfall_24hr_mm FROM rainfall_stations WHERE rainfall_24hr_mm = 0 ORDER BY district")
+            return jsonify({"type":"table","title":f"Stations with zero rainfall ({len(rows)} stations)","cols":["station","district","rainfall_24hr_mm"],"rows":rows})
+
+        if any(w in q for w in ["all station","list station","every station","all rain"]):
+            rows = query("SELECT station, district, basin, rainfall_24hr_mm, cumulative_mm FROM rainfall_stations ORDER BY district, rainfall_24hr_mm DESC NULLS LAST")
+            return jsonify({"type":"table","title":f"All {len(rows)} rainfall stations","cols":["station","district","basin","rainfall_24hr_mm","cumulative_mm"],"rows":rows})
+
+        for dist_kw, dist_val in [("purulia","PURULIA"),("bankura","BANKURA"),("jhargram","JHARGRAM"),("purba","PURBA MEDINIPUR"),("paschim","PASCHIM MEDINIPUR"),("west medinipur","PASCHIM MEDINIPUR"),("east medinipur","PURBA MEDINIPUR")]:
+            if dist_kw in q:
+                rows = query("SELECT station, basin, rainfall_24hr_mm, cumulative_mm FROM rainfall_stations WHERE UPPER(district) LIKE ? ORDER BY rainfall_24hr_mm DESC NULLS LAST", (f"%{dist_val}%",))
+                return jsonify({"type":"table","title":f"Rainfall — {dist_val.title()}","cols":["station","basin","rainfall_24hr_mm","cumulative_mm"],"rows":rows})
+
+        if any(w in q for w in ["rising river","rivers rising","river rise","which river","rising"]):
+            rows = query("SELECT river, station, district, gauge_level, trend, danger_level_mGTS FROM river_gauges WHERE trend='Rising'")
+            extra = "<p class='mt safe-msg'>✅ None have crossed Danger Level (DL). All rivers are safe.</p>"
+            return jsonify({"type":"table","title":f"Rising rivers ({len(rows)})","cols":["river","station","gauge_level","trend","danger_level_mGTS"],"rows":rows,"extra":extra})
+
+        if any(w in q for w in ["danger level","above danger","crossed danger","above dl","flood level"]):
+            rows = query("""SELECT river, station, gauge_level, trend, danger_level_mGTS
+                FROM river_gauges WHERE gauge_level NOT IN ('BG') AND trend NOT IN ('--')
+                AND danger_level_mGTS IS NOT NULL
+                AND CAST(gauge_level AS REAL) >= danger_level_mGTS""")
+            if rows:
+                return jsonify({"type":"table","title":"Rivers above Danger Level","cols":["river","station","gauge_level","trend","danger_level_mGTS"],"rows":rows})
+            return jsonify({"type":"text","content":"✅ <b>No river has crossed the Danger Level (DL).</b><br>All gauge stations are currently Below Gauge (BG) or well under their danger level."})
+
+        if any(w in q for w in ["all river","river gauge","every river","river status","river level","show river"]):
+            rows = query("SELECT river, station, district, gauge_level, trend, danger_level_mGTS FROM river_gauges ORDER BY trend DESC, river")
+            return jsonify({"type":"table","title":f"All {len(rows)} river gauge stations","cols":["river","station","gauge_level","trend","danger_level_mGTS"],"rows":rows})
+
+        if any(w in q for w in ["embankment","damage","erosion","polaspai","daspur","slip","subsidence"]):
+            rows = query("SELECT district, block, description FROM embankment_damage")
+            return jsonify({"type":"damage","rows":rows})
+
+        if any(w in q for w in ["forecast","next 24","tomorrow","imd","warning","prediction"]):
+            rows = query("SELECT ds.district, ds.rainfall_status, ds.river_status, df.forecast FROM district_status ds LEFT JOIN district_forecast df ON ds.district=df.district ORDER BY ds.district")
+            return jsonify({"type":"table","title":"District-wise forecast (IMD Kolkata) — next 24 hrs","cols":["district","rainfall_status","river_status","forecast"],"rows":rows})
+
+        if any(w in q for w in ["district status","current status","status of all","all district"]):
+            rows = query("SELECT district, rainfall_status, river_status FROM district_status ORDER BY district")
+            return jsonify({"type":"table","title":"Current district status","cols":["district","rainfall_status","river_status"],"rows":rows})
+
+        if any(w in q for w in ["reservoir","mukutmanipur","dam","conservation"]):
+            rows = query("SELECT * FROM reservoir WHERE name IS NOT NULL LIMIT 1")
+            if rows:
+                r = rows[0]
+                cons = r.get("conservation_level_ft") or 0
+                pres = r.get("present_level_ft") or 0
+                diff = cons - pres
+                html = f"""<div class='res-grid'>
+                  <div class='res-item'><span class='rl'>Conservation Level</span><span class='rv'>{r.get("conservation_level_ft")} ft</span></div>
+                  <div class='res-item'><span class='rl'>Max Flood Level</span><span class='rv'>{r.get("max_flood_level_ft")} ft</span></div>
+                  <div class='res-item'><span class='rl'>Present Level</span><span class='rv safe-tag'>{r.get("present_level_ft")} ft</span></div>
+                  <div class='res-item'><span class='rl'>Inflow (24hrs)</span><span class='rv'>{r.get("inflow_acft")} ac-ft</span></div>
+                  <div class='res-item'><span class='rl'>Outflow (24hrs)</span><span class='rv'>{r.get("outflow_acft")} ac-ft</span></div>
+                  <div class='res-item'><span class='rl'>Observation Time</span><span class='rv'>{r.get("observation_time")}</span></div>
+                </div>
+                <p class='mt'>✅ Level is <b>{diff:.1f} ft</b> below conservation level — no concern.</p>"""
+                return jsonify({"type":"html","content":html})
+            return jsonify({"type":"text","content":"No reservoir data found."})
+
+        if any(w in q for w in ["inundation","flood area","waterlog","submerged"]):
+            return jsonify({"type":"text","content":"✅ <b>No inundation reported</b> in any district as of 24 June 2026."})
+
+        if any(w in q for w in ["how many","count station","number of station","total station"]):
+            rows = query("SELECT district, COUNT(*) AS count FROM rainfall_stations GROUP BY district ORDER BY district")
+            total = query("SELECT COUNT(*) AS c FROM rainfall_stations")[0]["c"]
+            return jsonify({"type":"table","title":f"Total rainfall stations: {total}","cols":["district","count"],"rows":rows})
+
+        return jsonify({"type":"text","content":"I didn't understand that. Try: <b>highest rainfall</b>, <b>rising rivers</b>, <b>embankment damage</b>, <b>reservoir</b>, <b>forecast</b>, or a district name like <b>Purulia</b> or <b>Bankura</b>."})
+
+    except Exception as e:
+        return jsonify({"type":"text","content":f"⚠️ Server error: {str(e)}"})
 
 
 # ─── STARTUP ───────────────────────────────────────────────────────
+# Auto-build DB on every startup (required for Render free tier)
+if os.path.exists(FILE1) and os.path.exists(FILE2):
+    print("Building database from Excel files...")
+    init_db()
+    print("Database ready.")
+else:
+    print("WARNING: Excel files not found. Some features will not work.")
 
 if __name__ == "__main__":
-    if not FILE1 or not FILE2:
-        print("ERROR: Excel files not found. Place them in the same folder as app.py")
-        print(f"Searched in: {BASE_DIR}")
-    else:
-        print(f"Using Excel file 1: {FILE1}")
-        print(f"Using Excel file 2: {FILE2}")
-        print("Reading Excel files and building database...")
-        init_db()
-        print("Starting website at http://localhost:5000")
-        app.run(debug=True, port=5000)
+    app.run(debug=True, port=5000)
